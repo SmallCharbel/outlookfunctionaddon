@@ -5,6 +5,7 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 
 module.exports = async function (context, req) {
     context.log('Processing email forwarding request');
+    context.log('Headers received:', JSON.stringify(req.headers));
 
     try {
         // Check if required parameters are present
@@ -22,6 +23,7 @@ module.exports = async function (context, req) {
         // Check for auth header
         if (!req.headers || !req.headers.authorization) {
             context.log.error('No authorization header provided');
+            context.log.error('Available headers:', JSON.stringify(req.headers));
             context.res = {
                 status: 401,
                 body: { error: 'Authentication required', success: false }
@@ -31,6 +33,7 @@ module.exports = async function (context, req) {
 
         // Extract the token from the Authorization header
         const authHeader = req.headers.authorization;
+        context.log('Auth header received:', authHeader.substring(0, 20) + '...');
         const accessToken = authHeader.replace('Bearer ', '');
         
         context.log('Creating Graph client with delegated token');
