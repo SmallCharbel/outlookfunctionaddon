@@ -2,6 +2,8 @@
 require('isomorphic-fetch');
 
 const { Client } = require('@microsoft/microsoft-graph-client');
+const { ClientSecretCredential } = require('@azure/identity');
+const { TokenCredentialAuthenticationProvider } = require('@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials');
 
 module.exports = async function (context, req) {
     context.log('Processing email forwarding request');
@@ -11,23 +13,50 @@ module.exports = async function (context, req) {
         const messageId = req.body && req.body.messageId;
         const accessToken = req.body && req.body.accessToken;
 
-        if (!messageId || !accessToken) {
-            context.log.error('Missing required parameters');
+        if (!messageId) {
+            context.log.error('Missing messageId parameter');
             context.res = {
                 status: 400,
-                body: { error: 'Missing required parameters. MessageId and accessToken are required.' }
+                body: { error: 'Missing messageId parameter.' }
             };
             return;
         }
 
-        context.log(`Processing message ID: ${messageId}`);
+        let client;
         
-        // Create Graph client with user's access token
-        const client = Client.init({
-            authProvider: (done) => {
-                done(null, accessToken);
+        // If user provided an access token, use it
+        if (accessToken) {
+            context.log('Using provided access token');
+            client = Client.init({
+                authProvider: (done) => {
+                    done(null, accessToken);
+                }
+            });
+        } 
+        // Otherwise, fall back to application authentication (requires admin consent)
+        else {
+            context.log('No access token provided, attempting to use app authentication');
+            const clientId = process.env.CLIENT_ID;
+            const clientSecret = process.env.CLIENT_SECRET;
+            const tenantId = process.env.TENANT_ID || 'common';
+            
+            if (!clientId || !clientSecret) {
+                context.log.error('App credentials not configured');
+                context.res = {
+                    status: 500,
+                    body: { error: 'Server not properly configured for app authentication.' }
+                };
+                return;
             }
-        });
+            
+            const credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+            const authProvider = new TokenCredentialAuthenticationProvider(credential, {
+                scopes: ['https://graph.microsoft.com/.default']
+            });
+            client = Client.initWithMiddleware({ authProvider });
+        }
+        
+        context.log(`Processing message ID: ${messageId}`);
         
         // 1. Get the original message
         context.log('Fetching original message...');
