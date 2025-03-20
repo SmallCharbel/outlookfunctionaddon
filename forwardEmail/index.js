@@ -20,21 +20,25 @@ module.exports = async function (context, req) {
             return;
         }
 
-        // Check for auth header
-        if (!req.headers || !req.headers.authorization) {
-            context.log.error('No authorization header provided');
-            context.log.error('Available headers:', JSON.stringify(req.headers));
+        // Try to get token from authorization header first
+        let accessToken = null;
+        if (req.headers && req.headers.authorization) {
+            context.log('Found authorization header');
+            accessToken = req.headers.authorization.replace('Bearer ', '');
+        }
+        // Fall back to token in request body
+        else if (req.body && req.body.accessToken) {
+            context.log('Using token from request body');
+            accessToken = req.body.accessToken;
+        }
+        else {
+            context.log.error('No authentication token provided');
             context.res = {
                 status: 401,
                 body: { error: 'Authentication required', success: false }
             };
             return;
         }
-
-        // Extract the token from the Authorization header
-        const authHeader = req.headers.authorization;
-        context.log('Auth header received:', authHeader.substring(0, 20) + '...');
-        const accessToken = authHeader.replace('Bearer ', '');
         
         context.log('Creating Graph client with delegated token');
         
