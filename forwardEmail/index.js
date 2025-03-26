@@ -5,32 +5,30 @@ const { Client } = require('@microsoft/microsoft-graph-client');
 
 // Modify the message retrieval approach
 async function getMessageWithRetry(client, messageId) {
-    const context = require('@azure/functions').context;
-    
     // Try multiple approaches to retrieve the message
     try {
         // Approach 1: Direct access with proper encoding
-        context.log("Approach 1: Using direct message ID with proper encoding");
+        console.log("Approach 1: Using direct message ID with proper encoding");
         // Don't re-encode an already encoded messageId
         return await client.api(`/me/messages/${messageId}`).get();
     } catch (error1) {
-        context.log.error(`Approach 1 failed: ${error1.message}`);
+        console.log(`Approach 1 failed: ${error1.message}`);
         
         try {
             // Approach 2: Try with beta endpoint
-            context.log("Approach 2: Using beta endpoint");
+            console.log("Approach 2: Using beta endpoint");
             return await client.api(`/beta/me/messages/${messageId}`).get();
         } catch (error2) {
-            context.log.error(`Approach 2 failed: ${error2.message}`);
+            console.log(`Approach 2 failed: ${error2.message}`);
             
             try {
                 // Approach 3: Try with $select to get minimal data
-                context.log("Approach 3: Using $select to get minimal data");
+                console.log("Approach 3: Using $select to get minimal data");
                 return await client.api(`/me/messages/${messageId}`)
                     .select('id,subject,body,toRecipients,from')
                     .get();
             } catch (error3) {
-                context.log.error(`Approach 3 failed: ${error3.message}`);
+                console.log(`Approach 3 failed: ${error3.message}`);
                 
                 // All approaches failed
                 throw new Error(`Failed to retrieve message using all approaches: ${error1.message}`);
