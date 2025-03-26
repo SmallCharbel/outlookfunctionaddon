@@ -61,119 +61,168 @@ module.exports = async function (context, req) {
             }
         });
         
-        // 1. Get the original message - FIXED API FORMAT
-        // URL encode the messageId to handle special characters
-        const encodedMessageId = encodeURIComponent(messageId);
-        context.log(`Encoded messageId: ${encodedMessageId}`);
-        
-        // Try to fetch the message using properly formatted endpoint
+        // Extract the mailbox address from the request
         const mailboxAddress = req.body.mailboxAddress;
-        let apiPath;
         
-        if (mailboxAddress) {
-            // If mailbox address is provided, use it in the path
-            context.log(`Using mailbox address: ${mailboxAddress}`);
-            apiPath = `/users/${mailboxAddress}/messages/${encodedMessageId}`;
-        } else {
-            // Otherwise use /me endpoint
-            apiPath = `/me/messages/${encodedMessageId}`;
-        }
+        // Try multiple approaches to get the message
+        let message = null;
+        let messageEndpoint = null;
         
-        context.log(`Using API path: ${apiPath}`);
-        
-        // Try a different approach if standard path doesn't work
+        // Approach 1: Try using the ID directly with proper encoding
         try {
-            const message = await client.api(apiPath)
+            context.log('Approach 1: Using direct message ID with encoding');
+            const encodedMessageId = encodeURIComponent(messageId);
+            context.log(`Encoded messageId: ${encodedMessageId}`);
+            
+            messageEndpoint = mailboxAddress ? 
+                `/users/${mailboxAddress}/messages/${encodedMessageId}` : 
+                `/me/messages/${encodedMessageId}`;
+                
+            context.log(`Using API path: ${messageEndpoint}`);
+            
+            message = await client.api(messageEndpoint)
                 .select('subject,body,toRecipients,ccRecipients')
                 .get();
+                
+            context.log('Successfully retrieved message using direct ID');
+        } catch (error1) {
+            context.log.error(`Approach 1 failed: ${error1.message}`);
             
-            context.log('Successfully retrieved original message');
-            
-            // 2. Get message attachments
-            context.log('Fetching attachments...');
-            const attachmentsResponse = await client.api(`${apiPath}/attachments`).get();
-            const attachments = attachmentsResponse.value || [];
-            
-            // 3. Create a draft of the new message
-            context.log('Creating new message draft...');
-            const newMessage = {
-                subject: message.subject,
-                body: {
-                    contentType: 'html',
-                    content: message.body.content
-                },
-                toRecipients: message.toRecipients,
-                ccRecipients: message.ccRecipients
-            };
-            
-            const draftApiPath = mailboxAddress ? `/users/${mailboxAddress}/messages` : '/me/messages';
-            const draft = await client.api(draftApiPath).post(newMessage);
-            
-            // 4. Add each attachment to the new message
-            if (attachments.length > 0) {
-                context.log(`Adding ${attachments.length} attachments...`);
-                for (const attachment of attachments) {
-                    context.log(`Adding attachment: ${attachment.name}`);
-                    const attachmentApiPath = mailboxAddress ? 
-                        `/users/${mailboxAddress}/messages/${draft.id}/attachments` : 
-                        `/me/messages/${draft.id}/attachments`;
+            // Approach 2: Try using a filter query
+            try {
+                context.log('Approach 2: Using filter query');
+                
+                // Extract a unique part of the message ID to use in the filter
+                // This assumes the message ID has a format where we can extract a unique identifier
+                const idParts = messageId.split('AAA');
+                const uniqueIdPart = idParts.length > 1 ? idParts[1].substring(0, 20) : messageId.substring(0, 20);
+                
+                const filterEndpoint = mailboxAddress ? 
+                    `/users/${mailboxAddress}/messages` : 
+                    `/me/messages`;
+                    
+                context.log(`Using filter endpoint: ${filterEndpoint}`);
+                context.log(`Filtering with ID part: ${uniqueIdPart}`);
+                
+                const messages = await client.api(filterEndpoint)
+                    .filter(`contains(id,'${uniqueIdPart}')`)
+                    .select('id,subject,body,toRecipients,ccRecipients')
+                    .top(1)
+                    .get();
+                    
+                if (messages && messages.value && messages.value.length > 0) {
+                    message = messages.value[0];
+                    messageEndpoint = mailboxAddress ? 
+                        `/users/${mailboxAddress}/messages/${message.id}` : 
+                        `/me/messages/${message.id}`;
                         
-                    await client.api(attachmentApiPath).post({
-                        '@odata.type': '#microsoft.graph.fileAttachment',
-                        name: attachment.name,
-                        contentBytes: attachment.contentBytes,
-                        contentType: attachment.contentType
+                    context.log('Successfully retrieved message using filter query');
+                } else {
+                    throw new Error('No messages found matching the filter criteria');
+                }
+            } catch (error2) {
+                context.log.error(`Approach 2 failed: ${error2.message}`);
+                
+                // Approach 3: Try using the beta endpoint
+                try {
+                    context.log('Approach 3: Using beta endpoint');
+                    
+                    // Create a new client specifically for the beta endpoint
+                    const betaClient = Client.init({
+                        authProvider: (done) => {
+                            done(null, accessToken);
+                        },
+                        baseUrl: "https://graph.microsoft.com/beta"
                     });
+                    
+                    const encodedMessageId = encodeURIComponent(messageId);
+                    const betaEndpoint = mailboxAddress ? 
+                        `/users/${mailboxAddress}/messages/${encodedMessageId}` : 
+                        `/me/messages/${encodedMessageId}`;
+                        
+                    context.log(`Using beta endpoint: ${betaEndpoint}`);
+                    
+                    message = await betaClient.api(betaEndpoint)
+                        .select('subject,body,toRecipients,ccRecipients')
+                        .get();
+                        
+                    messageEndpoint = betaEndpoint;
+                    context.log('Successfully retrieved message using beta endpoint');
+                } catch (error3) {
+                    context.log.error(`Approach 3 failed: ${error3.message}`);
+                    throw new Error(`Failed to retrieve message using all approaches: ${error1.message}`);
                 }
             }
-            
-            // 5. Send the new message
-            context.log('Sending the new message...');
-            const sendApiPath = mailboxAddress ? 
-                `/users/${mailboxAddress}/messages/${draft.id}/send` : 
-                `/me/messages/${draft.id}/send`;
-                
-            await client.api(sendApiPath).post({});
-            
-            // 6. Move original to deleted items
-            context.log('Moving original message to deleted items...');
-            const moveApiPath = mailboxAddress ? 
-                `/users/${mailboxAddress}/messages/${encodedMessageId}/move` : 
-                `/me/messages/${encodedMessageId}/move`;
-                
-            await client.api(moveApiPath).post({
-                destinationId: 'deleteditems'
-            });
-            
-            context.log('Process completed successfully');
-            context.res = {
-                status: 200,
-                body: { success: true }
-            };
-        } catch (graphError) {
-            // If the standard approach fails, try an alternative method
-            context.log.error(`Standard approach failed: ${graphError.message}`);
-            context.log.error('Trying alternative approach...');
-            
-            // Try using the beta endpoint which might handle the ID differently
-            const betaClient = Client.init({
-                authProvider: (done) => {
-                    done(null, accessToken);
-                },
-                baseUrl: "https://graph.microsoft.com/beta"
-            });
-            
-            // Try to get the message using the beta endpoint
-            const message = await betaClient.api(apiPath)
-                .select('subject,body,toRecipients,ccRecipients')
-                .get();
-            
-            // Continue with the rest of the process...
-            // (Similar to the code above, but using betaClient)
-            
-            // For brevity, throwing the error to be caught by the outer catch block
-            throw graphError;
         }
+        
+        if (!message) {
+            throw new Error('Failed to retrieve the message');
+        }
+        
+        // Now that we have the message, continue with the rest of the process
+        context.log('Successfully retrieved original message');
+        
+        // 2. Get message attachments
+        context.log('Fetching attachments...');
+        const attachmentsResponse = await client.api(`${messageEndpoint}/attachments`).get();
+        const attachments = attachmentsResponse.value || [];
+        
+        // 3. Create a draft of the new message
+        context.log('Creating new message draft...');
+        const newMessage = {
+            subject: message.subject,
+            body: {
+                contentType: 'html',
+                content: message.body.content
+            },
+            toRecipients: message.toRecipients,
+            ccRecipients: message.ccRecipients
+        };
+        
+        const draftApiPath = mailboxAddress ? `/users/${mailboxAddress}/messages` : '/me/messages';
+        const draft = await client.api(draftApiPath).post(newMessage);
+        
+        // 4. Add each attachment to the new message
+        if (attachments.length > 0) {
+            context.log(`Adding ${attachments.length} attachments...`);
+            for (const attachment of attachments) {
+                context.log(`Adding attachment: ${attachment.name}`);
+                const attachmentApiPath = mailboxAddress ? 
+                    `/users/${mailboxAddress}/messages/${draft.id}/attachments` : 
+                    `/me/messages/${draft.id}/attachments`;
+                    
+                await client.api(attachmentApiPath).post({
+                    '@odata.type': '#microsoft.graph.fileAttachment',
+                    name: attachment.name,
+                    contentBytes: attachment.contentBytes,
+                    contentType: attachment.contentType
+                });
+            }
+        }
+        
+        // 5. Send the new message
+        context.log('Sending the new message...');
+        const sendApiPath = mailboxAddress ? 
+            `/users/${mailboxAddress}/messages/${draft.id}/send` : 
+            `/me/messages/${draft.id}/send`;
+            
+        await client.api(sendApiPath).post({});
+        
+        // 6. Move original to deleted items
+        context.log('Moving original message to deleted items...');
+        const moveApiPath = mailboxAddress ? 
+            `/users/${mailboxAddress}/messages/${message.id}/move` : 
+            `/me/messages/${message.id}/move`;
+            
+        await client.api(moveApiPath).post({
+            destinationId: 'deleteditems'
+        });
+        
+        context.log('Process completed successfully');
+        context.res = {
+            status: 200,
+            body: { success: true }
+        };
     } catch (error) {
         // Enhanced error logging
         context.log.error(`Error: ${error.message}`);
