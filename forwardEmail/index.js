@@ -74,16 +74,44 @@ module.exports = async function (context, req) {
         const client = getAuthenticatedClient(accessToken);
         context.log("Creating Graph client with delegated token");
         
-        // Get the message
-        const message = await getMessageWithRetry(client, messageId);
-        
-        // Forward the message logic here
-        // ... existing code for forwarding ...
-        
-        context.res = {
-            status: 200,
-            body: { success: true, message: "Email forwarded successfully" }
-        };
+        // Get the message - using a different approach
+        try {
+            // Try a different approach that doesn't use the message ID directly in the URL path
+            context.log("Trying to get message with filter approach");
+            
+            // First, try to get messages with a filter
+            const messages = await client.api('/me/messages')
+                .top(10)  // Limit to 10 messages for performance
+                .get();
+            
+            context.log(`Retrieved ${messages.value.length} messages`);
+            
+            // Find the message with the matching ID
+            const message = messages.value.find(msg => msg.id === messageId);
+            
+            if (!message) {
+                throw new Error("Message not found in recent messages");
+            }
+            
+            context.log("Message found successfully");
+            context.log(`Subject: ${message.subject}`);
+            
+            // Return success for now - you can add forwarding logic later
+            context.res = {
+                status: 200,
+                body: { 
+                    success: true, 
+                    message: "Message found successfully",
+                    subject: message.subject
+                }
+            };
+        } catch (error) {
+            context.log.error(`Error retrieving message: ${error.message}`);
+            context.res = {
+                status: 500,
+                body: `Error retrieving message: ${error.message}`
+            };
+        }
     } catch (error) {
         context.log.error(`Error: ${error.message}`);
         context.res = {
