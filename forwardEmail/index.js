@@ -146,18 +146,38 @@ module.exports = async function (context, req) {
                     contentType: message.body.contentType,
                     content: message.body.content
                 },
-                toRecipients: [
-                    {
-                        emailAddress: {
-                            address: "jmarshall@ptai.com" // Replace with your forwarding address
-                        }
-                    }
-                ],
-                // Include original CC recipients if any
+                // Preserve all original recipients
+                toRecipients: message.toRecipients || [],
+                // Include original CC recipients
                 ccRecipients: message.ccRecipients || [],
                 // Copy importance from original
                 importance: message.importance || "normal"
             };
+            
+            // Add a note about forwarding to the body
+            if (message.body.contentType === "html") {
+                // For HTML body
+                let forwardingNote = "<hr><p><strong>Forwarded by Email Forwarder Add-in</strong></p>";
+                
+                // Add original sender
+                if (message.from && message.from.emailAddress) {
+                    forwardingNote += `<p><strong>Original From:</strong> ${message.from.emailAddress.name || message.from.emailAddress.address} (${message.from.emailAddress.address})</p>`;
+                }
+                
+                // Prepend to the body
+                newMessage.body.content = forwardingNote + newMessage.body.content;
+            } else {
+                // For plain text body
+                let forwardingNote = "\n\n----------\nForwarded by Email Forwarder Add-in\n";
+                
+                // Add original sender
+                if (message.from && message.from.emailAddress) {
+                    forwardingNote += `Original From: ${message.from.emailAddress.name || message.from.emailAddress.address} (${message.from.emailAddress.address})\n`;
+                }
+                
+                // Prepend to the body
+                newMessage.body.content = forwardingNote + newMessage.body.content;
+            }
             
             // Create the draft message
             const draftMessage = await client.api('/me/messages')
