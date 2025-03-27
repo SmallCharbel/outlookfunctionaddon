@@ -141,7 +141,7 @@ module.exports = async function (context, req) {
             // Create a new message draft
             context.log("Creating new message draft...");
             const newMessage = {
-                subject: `FW: ${message.subject}`,
+                subject: `${message.subject}`, // Keep the original subject without adding "FW:"
                 body: {
                     contentType: message.body.contentType,
                     content: message.body.content
@@ -154,29 +154,11 @@ module.exports = async function (context, req) {
                 importance: message.importance || "normal"
             };
             
-            // Add a note about forwarding to the body
-            if (message.body.contentType === "html") {
-                // For HTML body
-                let forwardingNote = "<hr><p><strong>Forwarded by Email Forwarder Add-in</strong></p>";
-                
-                // Add original sender
-                if (message.from && message.from.emailAddress) {
-                    forwardingNote += `<p><strong>Original From:</strong> ${message.from.emailAddress.name || message.from.emailAddress.address} (${message.from.emailAddress.address})</p>`;
-                }
-                
-                // Prepend to the body
-                newMessage.body.content = forwardingNote + newMessage.body.content;
-            } else {
-                // For plain text body
-                let forwardingNote = "\n\n----------\nForwarded by Email Forwarder Add-in\n";
-                
-                // Add original sender
-                if (message.from && message.from.emailAddress) {
-                    forwardingNote += `Original From: ${message.from.emailAddress.name || message.from.emailAddress.address} (${message.from.emailAddress.address})\n`;
-                }
-                
-                // Prepend to the body
-                newMessage.body.content = forwardingNote + newMessage.body.content;
+            // If there was a from address, we can set the sender name in a reply-to header
+            // This is optional and depends on your requirements
+            if (message.from && message.from.emailAddress) {
+                // You can optionally set a replyTo address if needed
+                // newMessage.replyTo = [message.from];
             }
             
             // Create the draft message
