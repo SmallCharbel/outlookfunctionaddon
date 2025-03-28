@@ -2,8 +2,6 @@
 require('isomorphic-fetch');
 
 const { Client } = require('@microsoft/microsoft-graph-client');
-const { ClientSecretCredential } = require('@azure/identity');
-const { TokenCredentialAuthenticationProvider } = require('@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials');
 
 // Modify the message retrieval approach
 async function getMessageWithRetry(client, messageId) {
@@ -41,161 +39,231 @@ async function getMessageWithRetry(client, messageId) {
 
 // Main function handler
 module.exports = async function (context, req) {
-    context.log('Forward Email function processing request.');
+    context.log("Processing email forwarding request");
     
     try {
-        // Check if we have the necessary data
-        if (!req.body) {
-            context.log.error('No request body provided');
+        // Log headers for debugging
+        context.log(`Headers received: ${JSON.stringify(req.headers)}`);
+        
+        // Log request body for debugging
+        context.log(`Request body: ${JSON.stringify(req.body || {})}`);
+        
+        // Get authorization token from header
+        const authHeader = req.headers.authorization || '';
+        if (!authHeader.startsWith('Bearer ')) {
+            context.log.error("No authorization token provided");
             context.res = {
-                status: 400,
-                body: { success: false, error: "No request body provided" }
+                status: 401,
+                body: "Unauthorized: No token provided"
             };
             return;
         }
         
-        // Get the access token from the Authorization header
-        let accessToken = null;
-        if (req.headers && req.headers.authorization) {
-            const authHeader = req.headers.authorization;
-            if (authHeader.startsWith('Bearer ')) {
-                accessToken = authHeader.substring(7);
-                context.log('Access token found in Authorization header');
+        context.log("Found authorization header");
+        const accessToken = authHeader.substring(7); // Remove 'Bearer ' prefix
+        
+        // Create Microsoft Graph client
+        const client = getAuthenticatedClient(accessToken);
+        context.log("Creating Graph client with delegated token");
+        
+        // Get message ID from request body or query parameters
+        let messageId = (req.body && req.body.messageId) || 
+                       (req.query && req.query.messageId);
+        
+        context.log(`Original message ID from request: ${messageId || 'Not provided'}`);
+        
+        if (!messageId) {
+            // If no message ID provided, list recent messages to help debugging
+            context.log("No message ID provided, retrieving recent messages");
+            
+            const messages = await client.api('/me/messages')
+                .top(5)
+                .select('id,subject,receivedDateTime')
+                .orderBy('receivedDateTime DESC')
+                .get();
+            
+            context.log(`Retrieved ${messages.value.length} recent messages`);
+            messages.value.forEach((msg, index) => {
+                context.log(`Message ${index + 1}: ID=${msg.id}, Subject=${msg.subject}`);
+            });
+            
+            context.res = {
+                status: 400,
+                body: {
+                    error: "Missing required parameter: messageId",
+                    recentMessages: messages.value.map(m => ({ id: m.id, subject: m.subject }))
+                }
+            };
+            return;
+        }
+        
+        // Validate the message ID format
+        if (!validateMessageId(messageId)) {
+            context.log.error(`Invalid message ID format: ${messageId}`);
+            
+            // Try to translate the ID if it seems to be in EWS format
+            if (messageId.includes('/')) {
+                try {
+                    context.log("Attempting to convert Exchange ID format to REST format");
+                    messageId = await convertExchangeId(client, messageId);
+                    context.log(`Converted message ID: ${messageId}`);
+                } catch (error) {
+                    context.log.error(`Failed to convert Exchange ID: ${error.message}`);
+                    // Continue with the original ID as a fallback
+                }
             }
         }
         
-        // Fallback to access token in body if not in header
-        if (!accessToken && req.body.accessToken) {
-            accessToken = req.body.accessToken;
-            context.log('Access token found in request body');
-        }
-        
-        if (!accessToken) {
-            context.log.error('No access token provided');
-            context.res = {
-                status: 401,
-                body: { success: false, error: "No access token provided" }
-            };
-            return;
-        }
-        
-        // Initialize Microsoft Graph client with the provided token
-        const authProvider = (callback) => {
-            callback(null, accessToken);
-        };
-        
-        const client = Client.init({
-            authProvider: authProvider
-        });
-        
-        // Get message ID - either directly provided or search by subject
-        let messageId = null;
-        
-        // Check if we should use subject-based search
-        if (req.body.useSubjectSearch && req.body.subject) {
-            context.log(`Searching for email with subject: ${req.body.subject}`);
+        // Fetch the original message
+        context.log(`Fetching original message with ID: ${messageId}`);
+        try {
+            const message = await client.api(`/me/messages/${messageId}`)
+                .select('subject,body,toRecipients,ccRecipients,bccRecipients,from,hasAttachments,importance,isRead')
+                .get();
             
+            context.log(`Successfully retrieved message: ${message.subject}`);
+            
+            // Fetch attachments if any
+            let attachments = [];
+            if (message.hasAttachments) {
+                context.log("Fetching attachments...");
+                const attachmentsResponse = await client.api(`/me/messages/${messageId}/attachments`)
+                    .get();
+                attachments = attachmentsResponse.value;
+                context.log(`Found ${attachments.length} attachments`);
+                
+                // Log attachment details for debugging
+                attachments.forEach((attachment, index) => {
+                    context.log(`Attachment ${index + 1}: Name=${attachment.name}, Type=${attachment["@odata.type"]}, Size=${attachment.size || 'unknown'}`);
+                });
+            }
+            
+            // Create a new message draft
+            context.log("Creating new message draft...");
+            const newMessage = {
+                subject: `${message.subject}`, // Keep the original subject without adding "FW:"
+                body: {
+                    contentType: message.body.contentType,
+                    content: message.body.content
+                },
+                // Preserve all original recipients
+                toRecipients: message.toRecipients || [],
+                // Include original CC recipients
+                ccRecipients: message.ccRecipients || [],
+                // Copy importance from original
+                importance: message.importance || "normal"
+            };
+            
+            // If there was a from address, we can set the sender name in a reply-to header
+            // This is optional and depends on your requirements
+            if (message.from && message.from.emailAddress) {
+                // You can optionally set a replyTo address if needed
+                // newMessage.replyTo = [message.from];
+            }
+            
+            // Create the draft message
+            const draftMessage = await client.api('/me/messages')
+                .post(newMessage);
+            
+            // Add attachments if any
+            if (attachments.length > 0) {
+                context.log(`Adding ${attachments.length} attachments...`);
+                
+                for (const attachment of attachments) {
+                    context.log(`Adding attachment: ${attachment.name}`);
+                    
+                    try {
+                        // Create proper attachment object based on type
+                        const attachmentData = {
+                            "@odata.type": attachment["@odata.type"],
+                            name: attachment.name,
+                            contentType: attachment.contentType
+                        };
+                        
+                        // Add contentBytes for file attachments
+                        if (attachment["@odata.type"] === "#microsoft.graph.fileAttachment") {
+                            attachmentData.contentBytes = attachment.contentBytes;
+                        } 
+                        // For item attachments, we need to handle differently
+                        else if (attachment["@odata.type"] === "#microsoft.graph.itemAttachment") {
+                            // For item attachments, we might need special handling
+                            context.log(`Item attachment detected: ${attachment.name}`);
+                            // You might need to fetch the item attachment content separately
+                            // This is a simplified approach
+                            attachmentData.item = attachment.item;
+                        }
+                        // For reference attachments
+                        else if (attachment["@odata.type"] === "#microsoft.graph.referenceAttachment") {
+                            attachmentData.referenceAttachmentType = attachment.referenceAttachmentType;
+                            attachmentData.sourceUrl = attachment.sourceUrl;
+                            attachmentData.providerType = attachment.providerType;
+                            attachmentData.permission = attachment.permission;
+                            attachmentData.isFolder = attachment.isFolder;
+                        }
+                        
+                        await client.api(`/me/messages/${draftMessage.id}/attachments`)
+                            .post(attachmentData);
+                            
+                        context.log(`Successfully added attachment: ${attachment.name}`);
+                    } catch (attachError) {
+                        context.log.error(`Error adding attachment ${attachment.name}: ${attachError.message}`);
+                        // Continue with other attachments even if one fails
+                    }
+                }
+            }
+            
+            // Send the message
+            context.log("Sending the new message...");
+            await client.api(`/me/messages/${draftMessage.id}/send`)
+                .post({});
+            
+            // Move original message to deleted items
+            context.log("Moving original message to deleted items...");
+            await client.api(`/me/messages/${messageId}/move`)
+                .post({
+                    destinationId: "deleteditems"
+                });
+            
+            context.log("Process completed successfully");
+            context.res = {
+                status: 200,
+                body: { 
+                    success: true, 
+                    message: "Email forwarded successfully"
+                }
+            };
+        } catch (error) {
+            context.log.error(`Error accessing message: ${error.message}`);
+            
+            // If we get a 404 or other error, try to list recent messages as a fallback
             try {
-                // Search for the email by subject
+                context.log("Error retrieving message. Listing recent messages to help troubleshoot...");
                 const messages = await client.api('/me/messages')
-                    .filter(`subject eq '${req.body.subject.replace(/'/g, "''")}'`)
                     .top(5)
                     .select('id,subject,receivedDateTime')
                     .orderBy('receivedDateTime DESC')
                     .get();
                 
-                if (messages.value && messages.value.length > 0) {
-                    // Use the most recent message with matching subject
-                    messageId = messages.value[0].id;
-                    context.log(`Found message with ID: ${messageId}`);
-                } else {
-                    context.log.error(`No messages found with subject: ${req.body.subject}`);
-                    context.res = {
-                        status: 404,
-                        body: {
-                            success: false,
-                            error: `No messages found with subject: ${req.body.subject}`
-                        }
-                    };
-                    return;
-                }
-            } catch (error) {
-                context.log.error(`Error searching for message: ${error.message}`);
                 context.res = {
-                    status: 500,
+                    status: 404,
                     body: {
-                        success: false,
-                        error: `Error searching for message: ${error.message}`
+                        error: `Message not found: ${error.message}`,
+                        messageIdUsed: messageId,
+                        recentMessages: messages.value.map(m => ({ id: m.id, subject: m.subject }))
                     }
                 };
-                return;
+            } catch (listError) {
+                context.res = {
+                    status: 500,
+                    body: `Error accessing message: ${error.message}`
+                };
             }
-        } else if (req.body.messageId) {
-            // Use the provided message ID
-            messageId = req.body.messageId;
-            context.log(`Using provided message ID: ${messageId}`);
-        } else {
-            context.log.error('No message ID or subject provided');
-            context.res = {
-                status: 400,
-                body: {
-                    success: false,
-                    error: "No message ID or subject provided"
-                }
-            };
-            return;
         }
-        
-        // Get the forward-to email address from environment variables
-        const forwardToEmail = process.env.FORWARD_TO_EMAIL;
-        if (!forwardToEmail) {
-            context.log.error('Forward-to email address not configured');
-            context.res = {
-                status: 500,
-                body: {
-                    success: false,
-                    error: "Forward-to email address not configured"
-                }
-            };
-            return;
-        }
-        
-        // Forward the email
-        context.log(`Forwarding message ${messageId} to ${forwardToEmail}`);
-        
-        const forwardRequest = {
-            message: {
-                toRecipients: [
-                    {
-                        emailAddress: {
-                            address: forwardToEmail
-                        }
-                    }
-                ]
-            },
-            comment: "Forwarded by Email Forward Add-in"
-        };
-        
-        await client.api(`/me/messages/${messageId}/forward`)
-            .post(forwardRequest);
-        
-        context.log('Email forwarded successfully');
-        context.res = {
-            status: 200,
-            body: {
-                success: true,
-                message: "Email forwarded successfully"
-            }
-        };
-        
     } catch (error) {
-        context.log.error(`Error forwarding email: ${error.message}`);
+        context.log.error(`Error: ${error.message}`);
         context.res = {
             status: 500,
-            body: {
-                success: false,
-                error: `Error forwarding email: ${error.message}`
-            }
+            body: `Error forwarding email: ${error.message}`
         };
     }
 };
