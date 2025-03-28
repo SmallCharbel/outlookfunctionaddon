@@ -72,6 +72,52 @@ module.exports = async function (context, req) {
         
         context.log(`Original message ID from request: ${messageId || 'Not provided'}`);
         
+        if (req.body.useMetadataSearch && req.body.subject) {
+            context.log(`Searching for email with subject: ${req.body.subject}`);
+            
+            try {
+                // Search for the email by subject
+                const filter = `subject eq '${req.body.subject.replace(/'/g, "''")}'`;
+                context.log(`Using filter: ${filter}`);
+                
+                const messages = await client.api('/me/messages')
+                    .filter(filter)
+                    .get();
+                
+                // Sort the messages by date (most recent first) in JavaScript
+                // This avoids using the orderBy function which seems to be causing issues
+                if (messages.value && messages.value.length > 0) {
+                    const sortedMessages = messages.value.sort((a, b) => {
+                        return new Date(b.receivedDateTime) - new Date(a.receivedDateTime);
+                    });
+                    
+                    // Use the most recent message with matching subject
+                    messageId = sortedMessages[0].id;
+                    context.log(`Found message with ID: ${messageId}`);
+                } else {
+                    context.log.error(`No messages found with subject: ${req.body.subject}`);
+                    context.res = {
+                        status: 404,
+                        body: {
+                            success: false,
+                            error: `No messages found with subject: ${req.body.subject}`
+                        }
+                    };
+                    return;
+                }
+            } catch (error) {
+                context.log.error(`Error searching for message: ${error.message}`);
+                context.res = {
+                    status: 500,
+                    body: {
+                        success: false,
+                        error: `Error searching for message: ${error.message}`
+                    }
+                };
+                return;
+            }
+        }
+        
         if (!messageId) {
             // If no message ID provided, list recent messages to help debugging
             context.log("No message ID provided, retrieving recent messages");
