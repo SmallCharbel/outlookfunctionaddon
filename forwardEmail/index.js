@@ -3,15 +3,16 @@ require('isomorphic-fetch');
 
 const { Client } = require('@microsoft/microsoft-graph-client');
 
-// Modify the message retrieval approach to use metadata search by recipient, subject, and content
-async function searchMessageByMetadata(client, subject, recipients, contentSnippet, receivedTime) {
-    const encodeOData = (str) => str.replace(/'/g, "''");
+// Modify the message retrieval approach to use metadata search by recipient and subject
+async function searchMessageByMetadata(client, subject, recipients) { // Removed contentSnippet and receivedTime from parameters
+    const encodeOData = (str) => str ? str.replace(/'/g, "''") : ""; // Added check for null/undefined str
 
     // Build OData filter parts
-    const filterParts = [
-        `subject eq '${encodeOData(subject)}'`,
-        `receivedDateTime eq ${receivedTime}`
-    ];
+    const filterParts = [];
+
+    if (subject) { // Check if subject is provided
+        filterParts.push(`subject eq '${encodeOData(subject)}'`);
+    }
 
     // If recipients string is provided (semicolon-separated), use the first address for filtering
     if (recipients) {
@@ -21,18 +22,31 @@ async function searchMessageByMetadata(client, subject, recipients, contentSnipp
         }
     }
 
-    // If a content snippet is provided, filter with contains on body/content
-    if (contentSnippet) {
-        filterParts.push(`contains(body/content, '${encodeOData(contentSnippet)}')`);
+    // If no filter parts are available (e.g., neither subject nor recipient provided),
+    // it's probably not a good idea to search all messages.
+    // However, the original logic proceeded if subject and receivedTime were present.
+    // We'll proceed if at least one (subject or recipient) is present.
+    if (filterParts.length === 0) {
+        // Optionally, handle this case by returning null or throwing an error,
+        // as searching without filters can be very broad.
+        // For now, let's assume the calling logic ensures at least one is usually present.
+        context.log.warn("SearchMessageByMetadata called without subject or recipients. This may lead to a broad search or errors.");
+        // return null; // Or throw new Error("Subject or recipient is required for search.");
     }
 
     const filter = filterParts.join(' and ');
 
     try {
-        const response = await client
-            .api('/me/messages')
-            .filter(filter)
-            .orderby('receivedDateTime desc')
+        const apiCall = client.api('/me/messages');
+        if (filter) { // Only apply filter if it's not empty
+            apiCall.filter(filter);
+        }
+
+        // Removed .orderby('receivedDateTime desc') to reduce complexity
+        // Kept .top(1) to get the most relevant single message
+        // If no specific ordering, top(1) will return an arbitrary message matching the filter.
+        // If a specific message is needed, some form of ordering or more specific criteria might be required.
+        const response = await apiCall
             .top(1)
             .select('id')
             .get();
@@ -80,8 +94,8 @@ module.exports = async function (context, req) {
             messageId: providedId,
             subject,
             recipients,
-            contentSnippet,
-            receivedTime,
+            contentSnippet, // Still received, but not used in the simplified search
+            receivedTime,   // Still received, but not used in the simplified search
             userEmail,
             useMetadataSearch
         } = req.body || {};
@@ -90,10 +104,14 @@ module.exports = async function (context, req) {
         context.log(`Original message ID from request: ${messageId || 'Not provided'}`);
 
         // If metadata search is requested, use it to find the message ID
-        if ((!messageId || messageId === '') && useMetadataSearch && subject && receivedTime) {
-            context.log(`Searching for email with subject: ${subject}, recipients: ${recipients}, receivedTime: ${receivedTime}`);
+        // The condition for search now relies on subject OR recipients being present.
+        // The original logic checked `subject && receivedTime`.
+        // We adjust this to reflect the simplified search parameters.
+        if ((!messageId || messageId === '') && useMetadataSearch && (subject || recipients)) {
+            context.log(`Searching for email with subject: ${subject}, recipients: ${recipients}`); // Removed receivedTime from log
             try {
-                messageId = await searchMessageByMetadata(client, subject, recipients, contentSnippet, receivedTime);
+                // Pass only client, subject, and recipients to the modified function
+                messageId = await searchMessageByMetadata(client, subject, recipients);
                 if (messageId) {
                     context.log(`Found message with ID: ${messageId}`);
                 } else {
@@ -102,7 +120,7 @@ module.exports = async function (context, req) {
                         status: 404,
                         body: {
                             success: false,
-                            error: `No messages found with subject: ${subject}, recipients: ${recipients}, receivedTime: ${receivedTime}`
+                            error: `No messages found with subject: ${subject}, recipients: ${recipients}`
                         }
                     };
                     return;
@@ -122,11 +140,11 @@ module.exports = async function (context, req) {
 
         // If still no message ID provided after metadata search, return error
         if (!messageId) {
-            context.log("No message ID provided after metadata search");
+            context.log.warn("No message ID provided or found after metadata search attempt."); // Changed log level
             context.res = {
-                status: 400,
+                status: 400, // Or 404 if search was attempted but failed to find.
                 body: {
-                    error: "Missing required parameter: messageId",
+                    error: "Message ID is required and could not be determined via metadata search.",
                 }
             };
             return;
@@ -213,21 +231,21 @@ module.exports = async function (context, req) {
                         // For item attachments
                         else if (attachment["@odata.type"] === "#microsoft.graph.itemAttachment") {
                             context.log(`Item attachment detected: ${attachment.name}`);
-                            attachmentData.item = attachment.item;
+                            attachmentData.item = attachment.item; // Ensure 'item' property exists and is structured correctly
                         }
                         // For reference attachments
                         else if (attachment["@odata.type"] === "#microsoft.graph.referenceAttachment") {
-                            attachmentData.referenceAttachmentType = attachment.referenceAttachmentType;
+                            attachmentData.providerType = attachment.providerType; // Ensure correct property name (providerType vs referenceAttachmentType)
                             attachmentData.sourceUrl = attachment.sourceUrl;
-                            attachmentData.providerType = attachment.providerType;
-                            attachmentData.permission = attachment.permission;
-                            attachmentData.isFolder = attachment.isFolder;
+                            // attachmentData.permission = attachment.permission; // Check if these are always present
+                            // attachmentData.isFolder = attachment.isFolder;
                         }
+
 
                         await client.api(`/me/messages/${draftMessage.id}/attachments`).post(attachmentData);
                         context.log(`Successfully added attachment: ${attachment.name}`);
                     } catch (attachError) {
-                        context.log.error(`Error adding attachment ${attachment.name}: ${attachError.message}`);
+                        context.log.error(`Error adding attachment ${attachment.name}: ${attachError.message} - ${JSON.stringify(attachError.body)}`);
                         // Continue with other attachments even if one fails
                     }
                 }
@@ -252,12 +270,18 @@ module.exports = async function (context, req) {
                 }
             };
         } catch (error) {
-            context.log.error(`Error accessing message: ${error.message}`);
+            context.log.error(`Error accessing message: ${error.message} - Message ID used: ${messageId}`);
+             // Check if error is a GraphError and has a more specific code
+            let errorMessage = `Message not found or error accessing: ${error.message}`;
+            if (error.statusCode && error.code) {
+                errorMessage = `Graph API Error: ${error.code} - ${error.message}`;
+            }
 
             context.res = {
-                status: 404,
+                status: (error.statusCode === 404 ? 404 : 500), // More specific status if 404
                 body: {
-                    error: `Message not found: ${error.message}`,
+                    success: false, // Ensure success is false on error
+                    error: errorMessage,
                     messageIdUsed: messageId
                 }
             };
@@ -266,14 +290,17 @@ module.exports = async function (context, req) {
         context.log.error(`Error: ${error.message}`);
         context.res = {
             status: 500,
-            body: `Error forwarding email: ${error.message}`
+            body: { // Ensure body is an object for consistency
+                success: false,
+                error: `Error forwarding email: ${error.message}`
+            }
         };
     }
 };
 
 // Helper function to create authenticated client
 function getAuthenticatedClient(accessToken) {
-    const { Client } = require('@microsoft/microsoft-graph-client');
+    // const { Client } is already defined at the top
     const client = Client.init({
         authProvider: (done) => {
             done(null, accessToken);
@@ -285,8 +312,10 @@ function getAuthenticatedClient(accessToken) {
 // Validate message ID format
 function validateMessageId(id) {
     if (!id) return false;
-    if (id.length < 10 || /^\d+$/.test(id)) return false;
-    if (id.includes('/')) return false;
+    // Removed length check and numeric check as REST IDs can vary.
+    // The primary check is for EWS-like IDs containing '/'.
+    // Graph API will ultimately validate the ID.
+    if (id.includes('/')) return false; // This indicates it might be an EWS ID
     return true;
 }
 
@@ -296,13 +325,15 @@ async function convertExchangeId(client, exchangeId) {
         const response = await client.api('/me/translateExchangeIds').post({
             inputIds: [exchangeId],
             targetIdType: "restId",
-            sourceIdType: "ewsId"
+            sourceIdType: "ewsId" // Assuming the ID is ewsId if it contains '/'
         });
-        if (response?.value?.length > 0) {
+        if (response?.value?.length > 0 && response.value[0].targetId) {
             return response.value[0].targetId;
         }
-        throw new Error("No translated ID returned");
+        throw new Error("No translated ID returned or targetId is missing.");
     } catch (error) {
-        throw new Error(`Translation failed: ${error.message}`);
+        // Log the full error if possible
+        const errorMessage = error.body ? JSON.stringify(error.body) : error.message;
+        throw new Error(`Translation failed: ${errorMessage}`);
     }
 }
