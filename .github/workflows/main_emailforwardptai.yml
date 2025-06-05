@@ -66,6 +66,6 @@ jobs:
           app-name: 'emailforwardptai'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_71D3DC1D70904CD892959DD2D5A13E6E }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_E9E78EBF912342C48666B85B1016CA3F }}
           sku: 'flexconsumption'
         
