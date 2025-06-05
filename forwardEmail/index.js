@@ -3,37 +3,28 @@ require('isomorphic-fetch');
 
 const { Client } = require('@microsoft/microsoft-graph-client');
 
-// Modify the message retrieval approach
-async function getMessageWithRetry(client, messageId) {
-    // Try multiple approaches to retrieve the message
+// Modify the message retrieval approach to use metadata search by recipient
+async function searchMessageByMetadata(client, subject, recipient, receivedTime) {
+    // Build OData filter: subject, toRecipients contains recipient, exact receivedDateTime
+    const encodeOData = (str) => str.replace(/'/g, "''");
+    const filter = [`subject eq '${encodeOData(subject)}'`,
+                    `toRecipients/any(r: r/emailAddress/address eq '${encodeOData(recipient)}')`,
+                    `receivedDateTime eq ${receivedTime}`]
+                    .join(' and ');
+
     try {
-        // Approach 1: Direct access with proper encoding
-        console.log("Approach 1: Using direct message ID with proper encoding");
-        // Don't re-encode an already encoded messageId
-        return await client.api(`/me/messages/${messageId}`).get();
-    } catch (error1) {
-        console.log(`Approach 1 failed: ${error1.message}`);
-        
-        try {
-            // Approach 2: Try with beta endpoint
-            console.log("Approach 2: Using beta endpoint");
-            return await client.api(`/beta/me/messages/${messageId}`).get();
-        } catch (error2) {
-            console.log(`Approach 2 failed: ${error2.message}`);
-            
-            try {
-                // Approach 3: Try with $select to get minimal data
-                console.log("Approach 3: Using $select to get minimal data");
-                return await client.api(`/me/messages/${messageId}`)
-                    .select('id,subject,body,toRecipients,from')
-                    .get();
-            } catch (error3) {
-                console.log(`Approach 3 failed: ${error3.message}`);
-                
-                // All approaches failed
-                throw new Error(`Failed to retrieve message using all approaches: ${error1.message}`);
-            }
+        const response = await client.api(`/me/messages`)
+            .filter(filter)
+            .orderby('receivedDateTime desc')
+            .top(1)
+            .select('id')
+            .get();
+        if (response.value && response.value.length > 0) {
+            return response.value[0].id;
         }
+        return null;
+    } catch (err) {
+        throw new Error(`Error searching by metadata: ${err.message}`);
     }
 }
 
@@ -66,32 +57,50 @@ module.exports = async function (context, req) {
         const client = getAuthenticatedClient(accessToken);
         context.log("Creating Graph client with delegated token");
         
-        // Get message ID from request body or query parameters
-        let messageId = (req.body && req.body.messageId) || 
-                       (req.query && req.query.messageId);
+        // Extract metadata fields
+        const { messageId: providedId, subject, recipients, receivedTime, userEmail, useMetadataSearch } = req.body || {};
         
+        let messageId = providedId;
         context.log(`Original message ID from request: ${messageId || 'Not provided'}`);
         
+        // If metadata search is requested, use it to find the message ID by recipient
+        if ((!messageId || messageId === '') && useMetadataSearch && subject && recipients && receivedTime) {
+            context.log(`Searching for email with subject: ${subject}, recipient: ${recipients}, receivedTime: ${receivedTime}`);
+            try {
+                messageId = await searchMessageByMetadata(client, subject, recipients, receivedTime);
+                if (messageId) {
+                    context.log(`Found message with ID: ${messageId}`);
+                } else {
+                    context.log.error(`No messages found matching metadata criteria`);
+                    context.res = {
+                        status: 404,
+                        body: {
+                            success: false,
+                            error: `No messages found with subject: ${subject}, recipient: ${recipients}, receivedTime: ${receivedTime}`
+                        }
+                    };
+                    return;
+                }
+            } catch (error) {
+                context.log.error(`Error searching for message: ${error.message}`);
+                context.res = {
+                    status: 500,
+                    body: {
+                        success: false,
+                        error: `Error searching for message: ${error.message}`
+                    }
+                };
+                return;
+            }
+        }
+        
+        // If still no message ID provided after metadata search, return error
         if (!messageId) {
-            // If no message ID provided, list recent messages to help debugging
-            context.log("No message ID provided, retrieving recent messages");
-            
-            const messages = await client.api('/me/messages')
-                .top(5)
-                .select('id,subject,receivedDateTime')
-                .orderBy('receivedDateTime DESC')
-                .get();
-            
-            context.log(`Retrieved ${messages.value.length} recent messages`);
-            messages.value.forEach((msg, index) => {
-                context.log(`Message ${index + 1}: ID=${msg.id}, Subject=${msg.subject}`);
-            });
-            
+            context.log("No message ID provided after metadata search");
             context.res = {
                 status: 400,
                 body: {
                     error: "Missing required parameter: messageId",
-                    recentMessages: messages.value.map(m => ({ id: m.id, subject: m.subject }))
                 }
             };
             return;
@@ -154,13 +163,6 @@ module.exports = async function (context, req) {
                 importance: message.importance || "normal"
             };
             
-            // If there was a from address, we can set the sender name in a reply-to header
-            // This is optional and depends on your requirements
-            if (message.from && message.from.emailAddress) {
-                // You can optionally set a replyTo address if needed
-                // newMessage.replyTo = [message.from];
-            }
-            
             // Create the draft message
             const draftMessage = await client.api('/me/messages')
                 .post(newMessage);
@@ -186,10 +188,7 @@ module.exports = async function (context, req) {
                         } 
                         // For item attachments, we need to handle differently
                         else if (attachment["@odata.type"] === "#microsoft.graph.itemAttachment") {
-                            // For item attachments, we might need special handling
                             context.log(`Item attachment detected: ${attachment.name}`);
-                            // You might need to fetch the item attachment content separately
-                            // This is a simplified approach
                             attachmentData.item = attachment.item;
                         }
                         // For reference attachments
@@ -235,29 +234,14 @@ module.exports = async function (context, req) {
         } catch (error) {
             context.log.error(`Error accessing message: ${error.message}`);
             
-            // If we get a 404 or other error, try to list recent messages as a fallback
-            try {
-                context.log("Error retrieving message. Listing recent messages to help troubleshoot...");
-                const messages = await client.api('/me/messages')
-                    .top(5)
-                    .select('id,subject,receivedDateTime')
-                    .orderBy('receivedDateTime DESC')
-                    .get();
-                
-                context.res = {
-                    status: 404,
-                    body: {
-                        error: `Message not found: ${error.message}`,
-                        messageIdUsed: messageId,
-                        recentMessages: messages.value.map(m => ({ id: m.id, subject: m.subject }))
-                    }
-                };
-            } catch (listError) {
-                context.res = {
-                    status: 500,
-                    body: `Error accessing message: ${error.message}`
-                };
-            }
+            // If we get a 404 or other error, return it
+            context.res = {
+                status: 404,
+                body: {
+                    error: `Message not found: ${error.message}`,
+                    messageIdUsed: messageId
+                }
+            };
         }
     } catch (error) {
         context.log.error(`Error: ${error.message}`);
