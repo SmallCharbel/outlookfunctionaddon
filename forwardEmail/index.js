@@ -4,58 +4,71 @@ require('isomorphic-fetch');
 const { Client } = require('@microsoft/microsoft-graph-client');
 
 // Modify the message retrieval approach to use metadata search by recipient and subject
-async function searchMessageByMetadata(client, subject, recipients) { // Removed contentSnippet and receivedTime from parameters
-    const encodeOData = (str) => str ? str.replace(/'/g, "''") : ""; // Added check for null/undefined str
+async function searchMessageByMetadata(client, subject, recipients, context) { // Added context for logging
+    const encodeOData = (str) => str ? str.replace(/'/g, "''") : "";
 
     // Build OData filter parts
     const filterParts = [];
 
-    if (subject) { // Check if subject is provided
+    if (subject) {
         filterParts.push(`subject eq '${encodeOData(subject)}'`);
     }
 
-    // If recipients string is provided (semicolon-separated), use the first address for filtering
+    // If recipients string is provided (semicolon-separated), add a filter for each recipient
     if (recipients) {
-        const firstRecipient = recipients.split(';')[0].trim();
-        if (firstRecipient) {
-            filterParts.push(`toRecipients/any(r: r/emailAddress/address eq '${encodeOData(firstRecipient)}')`);
+        const recipientList = recipients.split(';').map(r => r.trim()).filter(r => r); // Get a clean list of recipients
+        if (recipientList.length > 0) {
+            recipientList.forEach(recipientAddress => {
+                // Add a filter condition for each recipient
+                // This ensures the message was sent to ALL specified recipients.
+                // Note: The Graph API's $filter on `toRecipients` checks if *any* of the emailAddress objects in the collection match.
+                // To ensure a message was sent to *all* specified recipients, each must be an 'and' condition.
+                filterParts.push(`toRecipients/any(r: r/emailAddress/address eq '${encodeOData(recipientAddress)}')`);
+            });
         }
     }
 
-    // If no filter parts are available (e.g., neither subject nor recipient provided),
-    // it's probably not a good idea to search all messages.
-    // However, the original logic proceeded if subject and receivedTime were present.
-    // We'll proceed if at least one (subject or recipient) is present.
     if (filterParts.length === 0) {
-        // Optionally, handle this case by returning null or throwing an error,
-        // as searching without filters can be very broad.
-        // For now, let's assume the calling logic ensures at least one is usually present.
-        context.log.warn("SearchMessageByMetadata called without subject or recipients. This may lead to a broad search or errors.");
-        // return null; // Or throw new Error("Subject or recipient is required for search.");
+        if (context && context.log) { // Check if context and context.log are available
+            context.log.warn("SearchMessageByMetadata called without subject or recipients. This may lead to a broad search or errors.");
+        }
+        return null; // Avoid searching without any filters
     }
 
     const filter = filterParts.join(' and ');
+    if (context && context.log) {
+        context.log.info(`Constructed OData filter: ${filter}`);
+    }
+
 
     try {
         const apiCall = client.api('/me/messages');
-        if (filter) { // Only apply filter if it's not empty
+        if (filter) {
             apiCall.filter(filter);
         }
 
-        // Removed .orderby('receivedDateTime desc') to reduce complexity
-        // Kept .top(1) to get the most relevant single message
-        // If no specific ordering, top(1) will return an arbitrary message matching the filter.
-        // If a specific message is needed, some form of ordering or more specific criteria might be required.
+        // Add orderby to get the latest message first
+        // Keep .top(1) to get the most relevant single (latest) message
         const response = await apiCall
+            .orderby('receivedDateTime desc') // Sort by received time, latest first
             .top(1)
-            .select('id')
+            .select('id,receivedDateTime,subject') // Added receivedDateTime and subject for logging/verification if needed
             .get();
 
         if (response.value && response.value.length > 0) {
+            if (context && context.log) {
+                 context.log.info(`Found message with ID: ${response.value[0].id}, Subject: ${response.value[0].subject}, Received: ${response.value[0].receivedDateTime}`);
+            }
             return response.value[0].id;
+        }
+        if (context && context.log) {
+            context.log.info("No messages found matching the specified criteria.");
         }
         return null;
     } catch (err) {
+         if (context && context.log) {
+            context.log.error(`Error searching by metadata: ${err.message}. Filter used: ${filter}`);
+        }
         throw new Error(`Error searching by metadata: ${err.message}`);
     }
 }
@@ -104,23 +117,20 @@ module.exports = async function (context, req) {
         context.log(`Original message ID from request: ${messageId || 'Not provided'}`);
 
         // If metadata search is requested, use it to find the message ID
-        // The condition for search now relies on subject OR recipients being present.
-        // The original logic checked `subject && receivedTime`.
-        // We adjust this to reflect the simplified search parameters.
         if ((!messageId || messageId === '') && useMetadataSearch && (subject || recipients)) {
-            context.log(`Searching for email with subject: ${subject}, recipients: ${recipients}`); // Removed receivedTime from log
+            context.log(`Searching for email with subject: "${subject}", recipients: "${recipients}"`);
             try {
-                // Pass only client, subject, and recipients to the modified function
-                messageId = await searchMessageByMetadata(client, subject, recipients);
+                // Pass context to searchMessageByMetadata for logging
+                messageId = await searchMessageByMetadata(client, subject, recipients, context);
                 if (messageId) {
                     context.log(`Found message with ID: ${messageId}`);
                 } else {
-                    context.log.error(`No messages found matching metadata criteria`);
+                    context.log.error(`No messages found matching metadata criteria: Subject="${subject}", Recipients="${recipients}"`);
                     context.res = {
                         status: 404,
                         body: {
                             success: false,
-                            error: `No messages found with subject: ${subject}, recipients: ${recipients}`
+                            error: `No messages found with subject: "${subject}", and all recipients: "${recipients}"`
                         }
                     };
                     return;
@@ -140,10 +150,11 @@ module.exports = async function (context, req) {
 
         // If still no message ID provided after metadata search, return error
         if (!messageId) {
-            context.log.warn("No message ID provided or found after metadata search attempt."); // Changed log level
+            context.log.warn("No message ID provided or found after metadata search attempt.");
             context.res = {
-                status: 400, // Or 404 if search was attempted but failed to find.
+                status: 400,
                 body: {
+                    success: false, // ensure success is false
                     error: "Message ID is required and could not be determined via metadata search.",
                 }
             };
@@ -154,15 +165,13 @@ module.exports = async function (context, req) {
         if (!validateMessageId(messageId)) {
             context.log.error(`Invalid message ID format: ${messageId}`);
 
-            // Try to translate the ID if it seems to be in EWS format
             if (messageId.includes('/')) {
                 try {
                     context.log("Attempting to convert Exchange ID format to REST format");
-                    messageId = await convertExchangeId(client, messageId);
+                    messageId = await convertExchangeId(client, messageId, context); // Pass context
                     context.log(`Converted message ID: ${messageId}`);
                 } catch (error) {
                     context.log.error(`Failed to convert Exchange ID: ${error.message}`);
-                    // Continue with the original ID as a fallback
                 }
             }
         }
@@ -184,7 +193,6 @@ module.exports = async function (context, req) {
                 attachments = attachmentsResponse.value;
                 context.log(`Found ${attachments.length} attachments`);
 
-                // Log attachment details for debugging
                 attachments.forEach((attachment, index) => {
                     context.log(`Attachment ${index + 1}: Name=${attachment.name}, Type=${attachment["@odata.type"]}, Size=${attachment.size || 'unknown'}`);
                 });
@@ -193,69 +201,49 @@ module.exports = async function (context, req) {
             // Create a new message draft
             context.log("Creating new message draft...");
             const newMessage = {
-                subject: `${message.subject}`, // Keep the original subject without adding "FW:"
+                subject: `${message.subject}`,
                 body: {
                     contentType: message.body.contentType,
                     content: message.body.content
                 },
-                // Preserve all original recipients
                 toRecipients: message.toRecipients || [],
-                // Include original CC recipients
                 ccRecipients: message.ccRecipients || [],
-                // Copy importance from original
                 importance: message.importance || "normal"
             };
 
-            // Create the draft message
             const draftMessage = await client.api('/me/messages').post(newMessage);
 
-            // Add attachments if any
             if (attachments.length > 0) {
                 context.log(`Adding ${attachments.length} attachments...`);
-
                 for (const attachment of attachments) {
                     context.log(`Adding attachment: ${attachment.name}`);
-
                     try {
-                        // Create proper attachment object based on type
                         const attachmentData = {
                             "@odata.type": attachment["@odata.type"],
                             name: attachment.name,
                             contentType: attachment.contentType
                         };
 
-                        // Add contentBytes for file attachments
                         if (attachment["@odata.type"] === "#microsoft.graph.fileAttachment") {
                             attachmentData.contentBytes = attachment.contentBytes;
-                        }
-                        // For item attachments
-                        else if (attachment["@odata.type"] === "#microsoft.graph.itemAttachment") {
+                        } else if (attachment["@odata.type"] === "#microsoft.graph.itemAttachment") {
                             context.log(`Item attachment detected: ${attachment.name}`);
-                            attachmentData.item = attachment.item; // Ensure 'item' property exists and is structured correctly
-                        }
-                        // For reference attachments
-                        else if (attachment["@odata.type"] === "#microsoft.graph.referenceAttachment") {
-                            attachmentData.providerType = attachment.providerType; // Ensure correct property name (providerType vs referenceAttachmentType)
+                            attachmentData.item = attachment.item;
+                        } else if (attachment["@odata.type"] === "#microsoft.graph.referenceAttachment") {
+                            attachmentData.providerType = attachment.providerType;
                             attachmentData.sourceUrl = attachment.sourceUrl;
-                            // attachmentData.permission = attachment.permission; // Check if these are always present
-                            // attachmentData.isFolder = attachment.isFolder;
                         }
-
-
                         await client.api(`/me/messages/${draftMessage.id}/attachments`).post(attachmentData);
                         context.log(`Successfully added attachment: ${attachment.name}`);
                     } catch (attachError) {
                         context.log.error(`Error adding attachment ${attachment.name}: ${attachError.message} - ${JSON.stringify(attachError.body)}`);
-                        // Continue with other attachments even if one fails
                     }
                 }
             }
 
-            // Send the message
             context.log("Sending the new message...");
             await client.api(`/me/messages/${draftMessage.id}/send`).post({});
 
-            // Move original message to deleted items
             context.log("Moving original message to deleted items...");
             await client.api(`/me/messages/${messageId}/move`).post({
                 destinationId: "deleteditems"
@@ -271,16 +259,14 @@ module.exports = async function (context, req) {
             };
         } catch (error) {
             context.log.error(`Error accessing message: ${error.message} - Message ID used: ${messageId}`);
-             // Check if error is a GraphError and has a more specific code
             let errorMessage = `Message not found or error accessing: ${error.message}`;
             if (error.statusCode && error.code) {
                 errorMessage = `Graph API Error: ${error.code} - ${error.message}`;
             }
-
             context.res = {
-                status: (error.statusCode === 404 ? 404 : 500), // More specific status if 404
+                status: (error.statusCode === 404 ? 404 : 500),
                 body: {
-                    success: false, // Ensure success is false on error
+                    success: false,
                     error: errorMessage,
                     messageIdUsed: messageId
                 }
@@ -290,7 +276,7 @@ module.exports = async function (context, req) {
         context.log.error(`Error: ${error.message}`);
         context.res = {
             status: 500,
-            body: { // Ensure body is an object for consistency
+            body: {
                 success: false,
                 error: `Error forwarding email: ${error.message}`
             }
@@ -300,7 +286,6 @@ module.exports = async function (context, req) {
 
 // Helper function to create authenticated client
 function getAuthenticatedClient(accessToken) {
-    // const { Client } is already defined at the top
     const client = Client.init({
         authProvider: (done) => {
             done(null, accessToken);
@@ -312,28 +297,27 @@ function getAuthenticatedClient(accessToken) {
 // Validate message ID format
 function validateMessageId(id) {
     if (!id) return false;
-    // Removed length check and numeric check as REST IDs can vary.
-    // The primary check is for EWS-like IDs containing '/'.
-    // Graph API will ultimately validate the ID.
-    if (id.includes('/')) return false; // This indicates it might be an EWS ID
+    if (id.includes('/')) return false;
     return true;
 }
 
 // Convert Exchange ID to REST format using translateExchangeIds
-async function convertExchangeId(client, exchangeId) {
+async function convertExchangeId(client, exchangeId, context) { // Added context for logging
     try {
         const response = await client.api('/me/translateExchangeIds').post({
             inputIds: [exchangeId],
             targetIdType: "restId",
-            sourceIdType: "ewsId" // Assuming the ID is ewsId if it contains '/'
+            sourceIdType: "ewsId"
         });
         if (response?.value?.length > 0 && response.value[0].targetId) {
             return response.value[0].targetId;
         }
         throw new Error("No translated ID returned or targetId is missing.");
     } catch (error) {
-        // Log the full error if possible
         const errorMessage = error.body ? JSON.stringify(error.body) : error.message;
+         if (context && context.log) { // Check if context and context.log are available
+            context.log.error(`Translation failed for ID ${exchangeId}: ${errorMessage}`);
+        }
         throw new Error(`Translation failed: ${errorMessage}`);
     }
 }
